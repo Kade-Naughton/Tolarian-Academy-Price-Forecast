@@ -113,3 +113,18 @@ card_cv_acc |>
 
 saveRDS(card_cv_acc, "results/card_cv_acc.rds")   # save the accuracy table
 
+## DIEBOLD-MARIANO TEST
+# Testing if the difference in accuracy between the two models is statistically significant
+card_errs <- card_cv_fc |>
+  as_tibble() |>
+  filter(h == 4) |>                                    # 4-week-ahead forecasts only
+  left_join(as_tibble(card) |> select(Week, actual = price),
+            by = "Week") |>
+  mutate(e = actual - .mean) |>                        # forecast error in USD
+  select(.id, Week, .model, e) |>
+  pivot_wider(names_from = .model, values_from = e) |>
+  drop_na()                                            # remove forecasts with no actual yet
+
+#p<0.05 means the difference in accuracy is statistically significant, one model is better than the other
+forecast::dm.test(card_errs$arima, card_errs$ets,   alternative = "two.sided", h = 4, power = 2)
+forecast::dm.test(card_errs$arima, card_errs$naive, alternative = "two.sided", h = 4, power = 2)
