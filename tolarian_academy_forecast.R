@@ -13,3 +13,12 @@ card_raw <- read_csv(
   )
 )
 
+## ADJUSTING DATA
+# Transforms the data to include a week column and a price column (combines days into weeks and finds and gives mean price for each week)
+card <- card_raw |> 
+  as_tsibble(index = date) |>
+  index_by(Week = yearweek(date)) |>
+  summarise(price = mean(price_usd))
+# could add filter() to specify a date range, but it is not necessary for this data set
+
+has_gaps(card) # checks for gaps in the data. Returns FALSE, no gaps exist
