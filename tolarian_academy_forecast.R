@@ -46,3 +46,12 @@ card_fit <- card |>
 
 card_fit |> select(arima) |> report()
 card_fit |> select(ets) |> report()
+
+## RESIDUAL CHECKS
+# pval > 0.05 means residuals are white noise, model is good
+card_fit |> select(arima) |> gg_tsresiduals()
+
+card_fit |>
+  select(arima) |>
+  augment() |>
+  features(.innov, ljung_box, lag = 10, dof = 1)
