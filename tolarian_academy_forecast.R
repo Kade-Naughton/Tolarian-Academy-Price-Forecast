@@ -22,3 +22,18 @@ card <- card_raw |>
 # could add filter() to specify a date range, but it is not necessary for this data set
 
 has_gaps(card) # checks for gaps in the data. Returns FALSE, no gaps exist
+
+## PLOTS
+# Plots Prices, not adjusted
+card |>
+  autoplot(price) +
+  labs(title = "Sales price of Tolarian Academy #330 MTG Card",
+       x = "Week", y = "USD Price")
+
+# Transforms the price data to log(price) (this makes makes changes proportional, card moving 40 -> 44 and 180 -> 198 are both 10% increases but without log it doesnt look like that, steadies variance/swing,
+# curved growth becomes linear which is easier for models to fit, and makes sure all values are positive) and plots a seasonal plot of log(price)
+card |>
+  mutate(log_price = log(price)) |>
+  gg_season(log_price) +
+  labs(title = "Season Plot of log(Tolarian Academy Prices)",
+       x = "Week", y = "log(Price)")
