@@ -37,3 +37,12 @@ card |>
   gg_season(log_price) +
   labs(title = "Season Plot of log(Tolarian Academy Prices)",
        x = "Week", y = "log(Price)")
+
+## FITTING MODELS
+#
+card_fit <- card |>
+  model(arima = ARIMA(log(price)),
+        ets   = ETS(log(price)))
+
+card_fit |> select(arima) |> report()
+card_fit |> select(ets) |> report()
