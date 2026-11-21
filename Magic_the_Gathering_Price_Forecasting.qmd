@@ -1,0 +1,472 @@
+---
+title: "Can We Forecast the Price of Tolarian Academy?"
+subtitle: "A time-series forecasting study of a collectible Magic: The Gathering card"
+author: "Kade Naughton"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+    fig-width: 8
+    fig-height: 4.5
+    df-print: kable
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| code-summary: "Setup: packages and data"
+
+library(tidyverse)
+library(fpp3)
+library(knitr)
+
+# Daily USD (paper / "Tabletop") prices for the Urza's Saga printing of
+# Tolarian Academy, collected from MTGGoldfish's price history.
+card_raw <- read_csv(
+  "data/tolarian_academy_usd.csv",
+  na = ".",
+  col_types = cols(
+    date      = col_date(format = "%Y-%m-%d"),
+    price_usd = col_double()
+  )
+)
+
+# Collapse daily prices into one average price per week
+card <- card_raw |>
+  as_tsibble(index = date) |>
+  index_by(Week = yearweek(date)) |>
+  summarise(price = mean(price_usd))
+
+# Saved cross-validation accuracy (used for the summary below)
+cv_acc_saved <- readRDS("results/card_cv_acc.rds")
+rmse_of <- function(hh, mod) {
+  cv_acc_saved$RMSE[cv_acc_saved$h == hh & cv_acc_saved$.model == mod]
+}
+
+usd <- function(x) scales::dollar(x, accuracy = 0.01)
+peak <- card |> as_tibble() |> slice_max(price, n = 1)
+```
+
+## In short
+
+::: {.callout-tip appearance="simple"}
+## The answer in plain English
+
+**Short-term price movements in Tolarian Academy are essentially unpredictable.** The simplest possible forecast, "next week's price will be about the same as this week's," was **more accurate than two standard forecasting models** (ARIMA and exponential smoothing) at every horizon tested (1 to 4 weeks ahead). On the other hand, none of the differences between the models were large enough to be statistically meaningful.
+
+- Latest weekly average price: **`r usd(last(card$price))`** (week `r format(last(card$Week))`).
+- Typical 1-week-ahead forecast error (RMSE): **`r usd(rmse_of(1, "naive"))`** for the simple forecast, vs **`r usd(rmse_of(1, "arima"))`** for ARIMA.
+- Over the next 4 weeks, the models expect the price to stay near its current level. The uncertainty is wide, and grows with each week.
+:::
+
+This pattern is common for anything traded in a market, from stocks to trading cards. If price changes were easy to predict, buyers and sellers would act on the prediction until it stopped working.
+
+## 1. The card and the data
+
+**Tolarian Academy** is a rare land from Magic: The Gathering's *Urza's Saga* set (1998). It is on Wizards of the Coast's Reserved List, which means it will never be reprinted, so the existing supply is fixed. Its price depends entirely on collector and player demand.
+
+The data are **daily retail prices in US dollars** for the Urza's Saga printing in the paper ("Tabletop") market, taken from MTGGoldfish's price history. They run from `r format(min(card_raw$date), "%B %Y")` to `r format(max(card_raw$date), "%B %Y")` (`r format(nrow(card_raw), big.mark = ",")` daily observations).
+
+**Why weekly averages?** Daily prices are noisy and often repeat the same value for several days. Averaging each week gives a smoother series of **`r nrow(card)` weeks** with no missing weeks:
+
+```{r}
+#| label: gaps
+has_gaps(card) |> kable()
+```
+
+## 2. What the price history looks like
+
+```{r}
+#| label: fig-raw
+#| fig-cap: "Weekly average price of Tolarian Academy (USD)."
+card |>
+  autoplot(price) +
+  labs(title = "Sales price of Tolarian Academy (Urza's Saga)",
+       x = "Week", y = "USD price")
+```
+
+The card spent most of 2010–2019 between roughly \$20 and \$80, then rose sharply during the 2020–2021 collectibles boom. It peaked at **`r usd(peak$price)`** in week `r format(peak$Week)`. Since then it has moved in a wide range, recently settling near \$190.
+
+### Why we model the *logarithm* of price
+
+A move from \$40 to \$44 and a move from \$180 to \$198 are both **10% increases**, but on the plot above the second looks 4.5 times larger. Taking the log of the price puts equal *percentage* changes on equal footing:
+
+```{r}
+#| label: fig-log
+#| fig-cap: "Log of weekly price. Equal vertical distances = equal percentage changes."
+card |>
+  autoplot(log(price)) +
+  labs(title = "log(price) of Tolarian Academy",
+       x = "Week", y = "log(USD price)")
+```
+
+::: {.callout-note collapse="true"}
+## For forecasting readers: why log?
+
+- **Variance stabilization:** absolute weekly swings grow with the price level (cents at \$30, several dollars at \$190). The log transform makes the variance of changes roughly constant, which ARIMA's prediction intervals assume.
+- **Multiplicative dynamics become additive.** Differences of log prices are approximately percentage returns.
+- **Positive forecasts.** Back-transformed forecasts and intervals cannot go below \$0.
+- fable back-transforms automatically when the model is written as `ARIMA(log(price))`. The reported point forecast is the **mean** of the back-transformed distribution.
+:::
+
+### Is there a seasonal pattern?
+
+If prices rose and fell at the same time each year (for example, around the holidays or new set releases), a forecast could use that pattern. The seasonal plot overlays each year:
+
+```{r}
+#| label: fig-season
+#| fig-cap: "Seasonal plot of log(price): one line per year."
+card |>
+  mutate(log_price = log(price)) |>
+  gg_season(log_price) +
+  labs(title = "Seasonal plot of log(Tolarian Academy price)",
+       x = "Week of year", y = "log(price)")
+```
+
+The years sit at very different levels and don't share a repeating shape. A more formal check is the autocorrelation of **weekly percentage changes**, which shows whether this week's change tells you anything about future weeks:
+
+```{r}
+#| label: fig-acf
+#| fig-cap: "Autocorrelation of weekly log-price changes. Bars outside the blue dashed lines are statistically significant."
+card |>
+  mutate(dlog = difference(log(price))) |>
+  ACF(dlog, lag_max = 60) |>
+  autoplot() +
+  labs(title = "Autocorrelation of weekly changes in log(price)",
+       x = "Lag (weeks)")
+
+dlog_vec <- diff(log(card$price))
+acf_vals <- acf(dlog_vec, lag.max = 52, plot = FALSE)$acf
+```
+
+There is **no seasonal spike at lag 52** (autocorrelation `r round(acf_vals[53], 3)`), so we don't use seasonal models. The one clear signal is at **lag 1** (autocorrelation `r round(acf_vals[2], 2)`): a rising week tends to be followed by a slightly rising week.
+
+::: {.callout-warning collapse="true"}
+## For forecasting readers: the lag-1 autocorrelation is partly an averaging artefact
+
+Averaging a random walk over non-overlapping periods introduces positive first-order autocorrelation in the period-to-period changes, about 0.25 in the limit (Working, 1960). Some of the lag-1 correlation seen here is therefore likely a by-product of using **weekly means** rather than end-of-week prices. That helps explain why the ARIMA model below picks up an MA(1) term in-sample but does not beat a random walk out-of-sample. Re-running the analysis with `summarise(price = last(price_usd))` (end-of-week price) would be a useful robustness check.
+:::
+
+## 3. The forecasting models
+
+We compare three models, from simplest to most complex.
+
+| Model | Plain-English idea | Technical form |
+|------------------|-------------------------|-----------------------------|
+| **Random walk** (naive) | "Next week's price = this week's price." Price changes are pure luck. | $\hat{y}_{T+h} = y_T$ |
+| **ARIMA** | Like the random walk, but last week's surprise partly carries over into this week. | ARIMA(0,1,1) on $\log y_t$ |
+| **ETS** (exponential smoothing) | Tracks a smoothed price level plus a trend that gradually fades out. | ETS(M,Ad,N) on $\log y_t$ |
+
+The random walk is the **benchmark**. A more complex model is only worth using if it forecasts better than this "do nothing clever" approach.
+
+```{r}
+#| label: fit-full
+card_fit <- card |>
+  model(arima = ARIMA(log(price)),
+        ets   = ETS(log(price)))
+```
+
+::: panel-tabset
+## ARIMA
+
+```{r}
+#| label: report-arima
+card_fit |> select(arima) |> report()
+```
+
+`ARIMA()` searches automatically over model orders and chose **ARIMA(0,1,1)**:
+
+$$
+\Delta \log y_t = \varepsilon_t + \theta\,\varepsilon_{t-1}
+$$
+
+Here $\Delta \log y_t$ is the weekly percentage change. Part of last week's shock ($\theta \approx 0.42$) carries into this week, and after that the forecast is flat, exactly like a random walk.
+
+## ETS
+
+```{r}
+#| label: report-ets
+card_fit |> select(ets) |> report()
+```
+
+`ETS()` chose **ETS(M,Ad,N)**: multiplicative errors, an additive **damped** trend, and no seasonality. A smoothing parameter $\alpha \approx 1$ means the level follows the latest price almost one-for-one, which is random-walk-like behaviour. The trend damping ($\phi \approx 0.8$) makes any trend fade out within a few weeks.
+:::
+
+### Does the ARIMA model leave anything unexplained?
+
+A good model's leftover errors (**residuals**) should look like random noise, with no pattern a better model could still use.
+
+```{r}
+#| label: fig-resid
+#| fig-cap: "ARIMA residual diagnostics: residuals over time, their autocorrelation, and their distribution."
+#| fig-height: 6
+card_fit |> select(arima) |> gg_tsresiduals()
+```
+
+```{r}
+#| label: ljung-box
+lb <- card_fit |>
+  select(arima) |>
+  augment() |>
+  features(.innov, ljung_box, lag = 10, dof = 1)
+
+lb |> kable(digits = 3, col.names = c("Model", "Ljung-Box statistic", "p-value"))
+```
+
+The **Ljung-Box test** checks the first 10 residual autocorrelations together. Its p-value of **`r round(lb$lb_pvalue, 3)`** is well above 0.05, so there's no evidence of leftover autocorrelation, and the residuals behave like white noise.
+
+::: {.callout-note collapse="true"}
+## For forecasting readers: test settings
+
+`lag = 10` follows the usual recommendation for non-seasonal data. `dof = 1` subtracts the one estimated ARMA parameter ($p + q = 0 + 1$), giving a $\chi^2$ reference distribution with 9 degrees of freedom. The residual histogram has heavier tails than a normal distribution (sudden price jumps), so normal-theory prediction intervals may understate the risk of large moves.
+:::
+
+## 4. Testing the forecasts honestly
+
+Fitting a model well to past data doesn't guarantee good forecasts. To test forecasting ability fairly, we use **time-series cross-validation**: repeatedly pretend we're standing at some point in the past, forecast the next 1–4 weeks using only the data available then, and compare with what actually happened.
+
+| Round | Data the models can see       | Forecasts checked against |
+|-------|-------------------------------|---------------------------|
+| 1     | Weeks 1–104 (first two years) | Weeks 105–108             |
+| 2     | Weeks 1–106                   | Weeks 107–110             |
+| 3     | Weeks 1–108                   | Weeks 109–112             |
+| ...   | adding 2 weeks each round     | ...                       |
+
+This gives hundreds of genuine out-of-sample forecasts per model.
+
+```{r}
+#| label: cv-run
+#| eval: false
+#| code-summary: "Show code (slow: run once, results saved to results/)"
+library(future)
+library(progressr)
+handlers("cli")
+
+card_cv <- card |>
+  stretch_tsibble(.init = 104, .step = 2) |>
+  filter(.id < max(.id))
+
+plan(multisession)
+with_progress({
+  card_cv_fit <- card_cv |>
+    model(naive = NAIVE(price),
+          ets   = ETS(log(price)),
+          arima = ARIMA(log(price)))
+})
+plan(sequential)
+
+saveRDS(card_cv_fit, "results/card_cv_fit.rds")
+```
+
+```{r}
+#| label: cv-forecast
+card_cv_fit <- readRDS("results/card_cv_fit.rds")
+
+card_cv_fc <- card_cv_fit |>
+  forecast(h = 4) |>
+  group_by(.id, .model) |>
+  mutate(h = row_number()) |>
+  ungroup() |>
+  as_fable(response = "price", distribution = price)
+
+# Non-seasonal MASE: errors scaled by the average one-week change in the data
+mase_1 <- function(.resid, .train, ...) MASE(.resid = .resid, .train = .train, .period = 1)
+
+card_cv_acc <- card_cv_fc |>
+  accuracy(card, by = c("h", ".model"),
+           measures = list(RMSE = RMSE, MAE = MAE, MAPE = MAPE, MASE = mase_1))
+```
+
+The analysis used **`r n_distinct(card_cv_fc$.id)` forecasting rounds** per model.
+
+### How accurate was each model?
+
+::: {.callout-note appearance="simple"}
+## Reading the accuracy measures
+
+- **RMSE** (root mean squared error, \$): the typical size of a forecast miss, with large misses penalised heavily.
+- **MAE** (mean absolute error, \$): the average size of a miss.
+- **MAPE** (%): the average miss as a percentage of the price.
+- **MASE**: the average miss divided by the typical one-week price change. Values below 1 mean the forecast error is smaller than one ordinary week's move.
+
+For every measure, **lower is better**.
+:::
+
+::: panel-tabset
+## 1 week ahead
+
+```{r}
+#| label: acc-h1
+card_cv_acc |>
+  filter(h == 1) |>
+  select(Model = .model, RMSE, MAE, MAPE, MASE) |>
+  arrange(RMSE) |>
+  kable(digits = 2)
+```
+
+## 4 weeks ahead
+
+```{r}
+#| label: acc-h4
+card_cv_acc |>
+  filter(h == 4) |>
+  select(Model = .model, RMSE, MAE, MAPE, MASE) |>
+  arrange(RMSE) |>
+  kable(digits = 2)
+```
+
+## All horizons
+
+```{r}
+#| label: fig-acc-h
+#| fig-cap: "Forecast error (RMSE) grows the further ahead we forecast."
+card_cv_acc |>
+  ggplot(aes(x = h, y = RMSE, colour = .model)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 1:4) +
+  labs(x = "Weeks ahead", y = "RMSE (USD)", colour = "Model",
+       title = "Cross-validated forecast accuracy by horizon")
+```
+:::
+
+**The random walk had the lowest error on every measure at every horizon.** ETS fell furthest behind at longer horizons, most likely because its fading trend sometimes extended price spikes that then reversed. Errors for all models grow quickly with the horizon, as expected for a series whose changes are close to random.
+
+### Are the differences real, or just luck?
+
+A lower average error could still be down to chance. The **Diebold-Mariano (DM) test** checks whether two models' forecast errors differ by more than random variation would explain.
+
+- **p \< 0.05:** one model is genuinely more accurate.
+- **p ≥ 0.05:** we can't tell the models apart.
+
+```{r}
+#| label: dm-tests
+dm_compare <- function(fc, horizon, m1, m2) {
+  errs <- fc |>
+    as_tibble() |>
+    filter(h == horizon) |>
+    left_join(as_tibble(card) |> select(Week, actual = price), by = "Week") |>
+    mutate(e = actual - .mean) |>
+    select(.id, Week, .model, e) |>
+    pivot_wider(names_from = .model, values_from = e) |>
+    drop_na()
+
+  test <- forecast::dm.test(errs[[m1]], errs[[m2]],
+                            alternative = "two.sided", h = horizon, power = 2)
+
+  tibble(
+    `Weeks ahead`          = horizon,
+    Comparison             = paste(m1, "vs", m2),
+    `DM statistic`         = unname(test$statistic),
+    `p-value`              = test$p.value,
+    `Smaller errors`       = if (test$statistic > 0) m2 else m1,
+    `Significant at 5%?`   = if_else(test$p.value < 0.05, "Yes", "No")
+  )
+}
+
+dm_results <- bind_rows(
+  dm_compare(card_cv_fc, 1, "arima", "naive"),
+  dm_compare(card_cv_fc, 1, "ets",   "naive"),
+  dm_compare(card_cv_fc, 1, "arima", "ets"),
+  dm_compare(card_cv_fc, 4, "arima", "naive"),
+  dm_compare(card_cv_fc, 4, "ets",   "naive"),
+  dm_compare(card_cv_fc, 4, "arima", "ets")
+)
+
+dm_results |> kable(digits = 3)
+```
+
+**None of the comparisons are statistically significant** (smallest p-value: `r round(min(dm_results[["p-value"]]), 3)`). The random walk's lower average error is consistent, but not large enough to rule out chance. Either way, the extra complexity of ARIMA and ETS buys nothing.
+
+::: {.callout-note collapse="true"}
+## For forecasting readers: DM test settings
+
+Loss is squared error (`power = 2`, matching RMSE). Errors are in dollars on the original scale. The `h` argument sets the HAC (Newey-West-style) variance correction for the serial correlation that overlapping multi-step forecasts induce. A positive DM statistic means the first-named model had the larger loss. Because the cross-validation windows overlap and the series contains regime changes (the 2020–21 surge), the effective sample size is smaller than the raw count of forecasts, so the test is conservative here.
+:::
+
+## 5. The forecast: next 4 weeks
+
+We fit the two models of interest to the **full** history: the random walk (the most accurate in testing) and ARIMA (the best-fitting statistical model). Then we forecast four weeks ahead.
+
+```{r}
+#| label: final-fit
+card_final_fit <- card |>
+  model(naive = NAIVE(price),
+        arima = ARIMA(log(price)))
+
+card_final_fc <- card_final_fit |>
+  forecast(h = 4)
+```
+
+```{r}
+#| label: fig-forecast
+#| fig-cap: "4-week forecasts with 80% (dark) and 95% (light) prediction intervals, shown against prices since 2025."
+#| fig-height: 6
+card_final_fc |>
+  autoplot(card |> filter(Week >= yearweek("2025 W01")), level = c(80, 95)) +
+  facet_wrap(~ .model, ncol = 1) +
+  labs(y = "USD", x = NULL,
+       title = "Tolarian Academy: 4-week forecasts",
+       subtitle = "Random walk vs ARIMA on log price")
+```
+
+```{r}
+#| label: forecast-table
+card_final_fc |>
+  hilo(level = c(80, 95)) |>
+  unpack_hilo(c("80%", "95%")) |>
+  as_tibble() |>
+  mutate(Week = format(Week)) |>
+  select(Model = .model, Week, Forecast = .mean,
+         `80% low` = `80%_lower`, `80% high` = `80%_upper`,
+         `95% low` = `95%_lower`, `95% high` = `95%_upper`) |>
+  kable(digits = 2)
+```
+
+**How to read this:** the *forecast* is the model's best single guess. The **95% interval** is the range the price should fall in about 95 times out of 100, if the model's assumptions hold. Both models say roughly the same thing: **expect the price to stay near its current level, but a swing of 10% or more within a month would not be surprising.**
+
+::: {.callout-note collapse="true"}
+## For forecasting readers: why does the ARIMA forecast creep upward?
+
+The ARIMA model is fitted to log prices, and its forecast of the log price is flat after the first step. The plotted value is the **mean** of the back-transformed (log-normal) distribution, $\exp(\mu + \sigma_h^2/2)$. Because $\sigma_h^2$ grows with the horizon, the mean drifts slightly upward. This is a property of the log transform, not a predicted trend. The median forecast, $\exp(\mu)$, is flat. The log-scale intervals are also asymmetric (wider above than below), which is realistic for prices. The random walk's intervals are symmetric in dollars.
+:::
+
+## 6. Conclusions
+
+1.  **Short-term changes in Tolarian Academy's price behave close to a random walk.** The best guess for next week's or next month's price is today's price.
+2.  **More complex models did not help.** ARIMA and ETS fit the history well (ARIMA's residuals pass the white-noise test), but they forecast slightly *worse* than the random walk. Diebold-Mariano tests found no statistically significant difference at 1 or 4 weeks.
+3.  **By parsimony, the random walk is the preferred forecasting model.** When models are statistically tied, the simplest one is the better choice.
+4.  **Uncertainty is the main message.** Even one month out, the 95% prediction interval spans tens of dollars.
+
+### Limitations and next steps
+
+- **No outside information.** The models only see past prices. Real drivers, such as ban or unban announcements, popular new strategies, market-wide booms like 2020–21, and grading or collecting trends, are not included and could matter more than any time-series pattern.
+- **Weekly averaging** smooths the data and introduces a small artificial autocorrelation (see Section 2). Using end-of-week prices would be a cleaner test.
+- **One price source and one printing.** MTGGoldfish summarises retail listings. Condition, graded copies, and other marketplaces can differ.
+- **Fat tails and volatility clustering.** Sudden spikes are more common than a normal distribution implies. Bootstrapped intervals (`forecast(..., bootstrap = TRUE)`) or a volatility model would give a more honest picture of risk.
+- **Structural change.** The market before and after 2020 may behave differently. Repeating the cross-validation on post-2021 data only would show whether the conclusions still hold.
+
+## Appendix: reproducibility
+
+Code and data are organised as an RStudio project:
+
+- `data/tolarian_academy_usd.csv`: daily prices
+- `tolarian_academy_forecast.R`: full analysis script
+- `results/`: saved cross-validation models and accuracy tables (the cross-validation takes 10–20 minutes, so this report loads the saved results)
+
+Some numbers in the text (the ARIMA and ETS model orders and parameter values) were written for the current data. If you re-download prices and re-run the analysis, check that they still match the model reports.
+
+```{r}
+#| label: session-info
+#| code-summary: "Session info"
+sessionInfo()
+```
