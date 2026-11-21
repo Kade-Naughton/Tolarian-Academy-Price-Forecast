@@ -128,3 +128,33 @@ card_errs <- card_cv_fc |>
 #p<0.05 means the difference in accuracy is statistically significant, one model is better than the other
 forecast::dm.test(card_errs$arima, card_errs$ets,   alternative = "two.sided", h = 4, power = 2)
 forecast::dm.test(card_errs$arima, card_errs$naive, alternative = "two.sided", h = 4, power = 2)
+
+## FINAL MODELS: ARIMA & RANDOM WALK
+# Fit both models on the full dataset
+card_final_fit <- card |>
+  model(naive = NAIVE(price),                     # random walk
+        arima = ARIMA(log(price)))                # ARIMA on log price
+
+card_final_fit |> select(arima) |> report()       # check the ARIMA order chosen on the full data
+
+# 4-week-ahead forecasts 
+card_final_fc <- card_final_fit |>
+  forecast(h = 4)
+
+# Plot: recent history & forecasts with 80% and 95% intervals, one panel per model
+card_final_fc |>
+  autoplot(card |> filter(Week >= yearweek("2025 W01")), level = c(80, 95)) +
+  facet_wrap(~ .model, ncol = 1) +
+  labs(y = "USD", x = NULL,
+       title = "Tolarian Academy: 4-week forecasts",
+       subtitle = "Random walk vs ARIMA on log price")
+
+# Table: point forecasts with 80% and 95% intervals
+card_final_fc |>
+  hilo(level = c(80, 95)) |>
+  unpack_hilo(c("80%", "95%")) |>
+  as_tibble() |>
+  select(.model, Week, .mean, `80%_lower`, `80%_upper`, `95%_lower`, `95%_upper`) |>
+  knitr::kable(digits = 2)
+
+saveRDS(card_final_fc, "results/card_final_fc.rds")
