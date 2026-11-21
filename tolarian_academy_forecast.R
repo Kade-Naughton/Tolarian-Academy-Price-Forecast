@@ -30,7 +30,7 @@ card |>
   labs(title = "Sales price of Tolarian Academy #330 MTG Card",
        x = "Week", y = "USD Price")
 
-# Transforms the price data to log(price) (this makes makes changes proportional, card moving 40 -> 44 and 180 -> 198 are both 10% increases but without log it doesnt look like that, steadies variance/swing,
+# Transforms the price data to log(price) (this makes makes changes proportional, card moving 40 -> 44 and 180 -> 198 are both 10% increases but without log it doesn't look like that, steadies variance/swing,
 # curved growth becomes linear which is easier for models to fit, and makes sure all values are positive) and plots a seasonal plot of log(price)
 card |>
   mutate(log_price = log(price)) |>
@@ -55,3 +55,25 @@ card_fit |>
   select(arima) |>
   augment() |>
   features(.innov, ljung_box, lag = 10, dof = 1)
+
+## TS-CV
+# Set up values and runs TS-CV
+library(future)                                 # multicore processing
+library(progressr)                              # progress bar
+handlers("cli")
+
+card_cv <- card |>
+  stretch_tsibble(.init = 104, .step = 2) |>    # first training set = 104 weeks; each later set adds 2 weeks
+  filter(.id < max(.id))                        # drops the last window (no future data left to test against)
+
+plan(multisession)                              # use multiple cores
+
+with_progress({
+  card_cv_fit <- card_cv |>
+    model(naive = NAIVE(price),                 # random walk
+          ets   = ETS(log(price)),
+          arima = ARIMA(log(price)))
+})
+
+plan(sequential)                                # back to single-core
+saveRDS(card_cv_fit, "results/card_cv_fit.rds")
